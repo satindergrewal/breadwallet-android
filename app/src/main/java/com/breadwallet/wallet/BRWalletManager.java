@@ -12,6 +12,7 @@ import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.os.Handler;
 import android.os.SystemClock;
+import android.security.keystore.UserNotAuthenticatedException;
 import android.util.Log;
 import android.view.Display;
 import android.view.MotionEvent;
@@ -62,9 +63,11 @@ import com.google.zxing.common.BitMatrix;
 
 import junit.framework.Assert;
 
+import java.io.File;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.List;
@@ -121,56 +124,71 @@ public class BRWalletManager {
     }
 
     public boolean generateRandomSeed() {
-        SecureRandom sr = new SecureRandom();
-        String[] words = new String[0];
-        List<String> list;
-        try {
-            String languageCode = ctx.getString(R.string.lang);
-            list = WordsReader.getWordList(ctx, languageCode);
-            words = list.toArray(new String[list.size()]);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        byte[] keyBytes = sr.generateSeed(16);
-        if (words.length < 2000) {
-            RuntimeException ex = new IllegalArgumentException("the list is wrong, size: " + words.length);
-            FirebaseCrash.report(ex);
-            throw ex;
-        }
-        if (keyBytes.length == 0) throw new NullPointerException("failed to create the seed");
-        byte[] strPhrase = encodeSeed(keyBytes, words);
-        if (strPhrase == null || strPhrase.length == 0) {
-            RuntimeException ex = new NullPointerException("failed to encodeSeed");
-            FirebaseCrash.report(ex);
-            throw ex;
-        }
         boolean success = false;
+        byte[] keyBytes = new byte[0];
+        byte[] strBytes = new byte[0];
+        byte[] authKey = new byte[0];
         try {
-            success = KeyStoreManager.putKeyStorePhrase(strPhrase, ctx, BRConstants.PUT_PHRASE_NEW_WALLET_REQUEST_CODE);
-        } catch (BRKeystoreErrorException e) {
-            e.printStackTrace();
-            showSentReceivedToast(e.getMessage());
-            return false;
+            SecureRandom sr = new SecureRandom();
+            String[] words = new String[0];
+            List<String> list;
+            try {
+                String languageCode = ctx.getString(R.string.lang);
+                list = WordsReader.getWordList(ctx, languageCode);
+                words = list.toArray(new String[list.size()]);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            keyBytes = sr.generateSeed(16);
+            if (words.length != 2048) {
+                RuntimeException ex = new IllegalArgumentException("the list is wrong, size: " + words.length);
+                FirebaseCrash.report(ex);
+                throw ex;
+            }
+            if (keyBytes.length == 0) throw new NullPointerException("failed to create the seed");
+            byte[] strPhrase = encodeSeed(keyBytes, words);
+            if (strPhrase == null || strPhrase.length == 0) {
+                RuntimeException ex = new NullPointerException("failed to encodeSeed");
+                FirebaseCrash.report(ex);
+                throw ex;
+            }
+            boolean b;
+            try {
+                b = KeyStoreManager.putPhrase(strPhrase, ctx, BRConstants.PUT_PHRASE_NEW_WALLET_REQUEST_CODE);
+            } catch (UserNotAuthenticatedException e) {
+                return false;
+            }
+            if (!b) return false;
+
+            KeyStoreManager.putWalletCreationTime((int) (System.currentTimeMillis() / 1000), ctx);
+            strBytes = TypesConverter.getNullTerminatedPhrase(strPhrase);
+            byte[] pubKey = BRWalletManager.getInstance(ctx).getMasterPubKey(strBytes);
+            if (Utils.isNullOrEmpty(pubKey))
+                throw new RuntimeException("pubkey is malformed: " + Arrays.toString(pubKey));
+            KeyStoreManager.putMasterPublicKey(pubKey, ctx);
+
+            authKey = getAuthPrivKeyForAPI(keyBytes);
+            if (authKey == null || authKey.length == 0) {
+                RuntimeException ex = new IllegalArgumentException("authKey is invalid");
+                FirebaseCrash.report(ex);
+                throw ex;
+            }
+            KeyStoreManager.putAuthKey(authKey, ctx);
+
+            success = true;
+        } finally {
+            if (!success) {
+                KeyStoreManager.resetWalletKeyStore(ctx);
+                SharedPreferencesManager.clearAllPrefs(ctx);
+            }
+            Arrays.fill(keyBytes, (byte) 0);
+            Arrays.fill(strBytes, (byte) 0);
+            if (authKey != null)
+                Arrays.fill(authKey, (byte) 0);
         }
-        if (!success) return false;
-        byte[] authKey = getAuthPrivKeyForAPI(keyBytes);
-        if (authKey == null || authKey.length == 0) {
-            RuntimeException ex = new IllegalArgumentException("authKey is invalid");
-            FirebaseCrash.report(ex);
-            throw ex;
-        }
-        KeyStoreManager.putAuthKey(authKey, ctx);
-        KeyStoreManager.putWalletCreationTime((int) (System.currentTimeMillis() / 1000), ctx);
-        byte[] strBytes = TypesConverter.getNullTerminatedPhrase(strPhrase);
-        byte[] pubKey = BRWalletManager.getInstance(ctx).getMasterPubKey(strBytes);
-        if (Utils.isNullOrEmpty(pubKey))
-            throw new RuntimeException("pubkey is malformed: " + Arrays.toString(pubKey));
-        KeyStoreManager.putMasterPublicKey(pubKey, ctx);
 
         return true;
-
     }
-
 
     public boolean wipeKeyStore(Context context) {
         Log.e(TAG, "wipeKeyStore");
@@ -178,23 +196,82 @@ public class BRWalletManager {
     }
 
     /**
-     * true if keychain is available and we know that no wallet exists on it
+     * true if keystore is available and we know that no wallet exists on it
      */
     public boolean noWallet(Activity ctx) {
+        if (ctx == null) throw new NullPointerException("noWallet ctx is null");
+        if (isKeyStoreCorrupt(ctx)) return true;
+        patchIfNeeded(ctx);
         byte[] pubkey = KeyStoreManager.getMasterPublicKey(ctx);
 
         if (pubkey == null || pubkey.length == 0) {
             byte[] phrase;
             try {
-                phrase = KeyStoreManager.getKeyStorePhrase(ctx, 0);
+                phrase = KeyStoreManager.getPhrase(ctx, 0);
                 if (phrase == null || phrase.length == 0) {
                     return true;
                 }
-            } catch (BRKeystoreErrorException e) {
+            } catch (UserNotAuthenticatedException e) {
                 e.printStackTrace();
                 return false;
             }
 
+        }
+        return false;
+    }
+
+    private void patchIfNeeded(Activity ctx) {
+        Log.d(TAG, "patchIfNeeded: ");
+        byte[] phrase;
+        try {
+            phrase = KeyStoreManager.getPhrase(ctx, 0);
+        } catch (UserNotAuthenticatedException e) {
+            e.printStackTrace();
+            return;
+        }
+        byte[] strBytes = TypesConverter.getNullTerminatedPhrase(phrase);
+
+        if (Utils.isNullOrEmpty(KeyStoreManager.getMasterPublicKey(ctx))) {
+            Log.e(TAG, "patchIfNeeded: missing pubKey");
+            KeyStoreManager.putWalletCreationTime((int) (System.currentTimeMillis() / 1000), ctx);
+            byte[] pubKey = BRWalletManager.getInstance(ctx).getMasterPubKey(strBytes);
+            if (Utils.isNullOrEmpty(pubKey))
+                throw new RuntimeException("pubkey is malformed: " + Arrays.toString(pubKey));
+            KeyStoreManager.putMasterPublicKey(pubKey, ctx);
+            SQLiteManager.getInstance(ctx).deleteBlocks();
+            SQLiteManager.getInstance(ctx).deleteTransactions();
+            SQLiteManager.getInstance(ctx).deletePeers();
+        }
+
+        if (Utils.isNullOrEmpty(KeyStoreManager.getAuthKey(ctx))) {
+            Log.e(TAG, "patchIfNeeded: missing authKey");
+            byte[] seed = getSeedFromPhrase(strBytes);
+            byte[] authKey = getAuthPrivKeyForAPI(seed);
+            if (authKey == null || authKey.length == 0) {
+                RuntimeException ex = new IllegalArgumentException("authKey is invalid");
+                FirebaseCrash.report(ex);
+                throw ex;
+            }
+            KeyStoreManager.putAuthKey(authKey, ctx);
+        }
+    }
+
+    private boolean isKeyStoreCorrupt(Activity ctx) {
+        try {
+            List<String> aliases = new ArrayList<>();
+            aliases.add(KeyStoreManager.PHRASE_ALIAS);
+            for (String alias : aliases) {
+                KeyStoreManager.AliasObject obj = KeyStoreManager.aliasObjectMap.get(alias);
+                boolean fileExists = new File(KeyStoreManager.getEncryptedDataFilePath(obj.datafileName, ctx)).exists();
+                boolean ivExists = new File(KeyStoreManager.getEncryptedDataFilePath(obj.ivFileName, ctx)).exists();
+                if (!fileExists || !ivExists) {
+                    Log.e(TAG, "isKeyStoreCorrupt: KS corrupt for: " + alias + ", fileExists: " + fileExists + ", ivExists: " + ivExists);
+                    return true;
+                }
+            }
+        } catch (Exception ex) {
+            Log.e(TAG, "isKeyStoreCorrupt: KS corrupt with exception: " + ex.getMessage());
+            return true;
         }
         return false;
     }
@@ -1206,5 +1283,9 @@ public class BRWalletManager {
     public static native byte[] getSeedFromPhrase(byte[] phrase);
 
     public static native boolean isTestNet();
+
+    public static native byte[] sweepBCash(byte[] pubKey, String address, byte[] phrase);
+
+    public static native long getBCashBalance(byte[] pubKey);
 
 }
